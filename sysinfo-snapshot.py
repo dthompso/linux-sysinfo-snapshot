@@ -120,7 +120,7 @@ class LooseVersion:
 ######################################################################################################
 #                                     GLOBAL GENERAL VARIABLES
 
-version = "3.7.9.9"
+version = "3.8.0.2"
 sys_argv = sys.argv
 len_argv = len(sys.argv)
 driver_required_loading = False
@@ -1227,7 +1227,18 @@ def is_mft_installed():
             mft_message =  "MFT is not installed, please install MFT and try again."
     else:
         print("MFT is installed and its version is: %s" % output)
-        mft_installed = True
+        print("Checking if mft can be started ...")
+        # Check if mft can be started
+        # mst start
+        mst_status, mst_output = get_status_output("mst start")
+        if mst_status != 0:
+            mft_message = "MFT can not be started, please check the mft logs. Switching to mstflint (if installed)."
+            print("MFT can not be started, switching to mstflint (if installed).")
+            mft_installed = False
+        else:
+            mft_message = "MFT can be started successfully."
+            print("MFT can be started successfully.")
+            mft_installed = True
     return mft_installed, mft_message
 
 
@@ -1666,6 +1677,12 @@ def _is_amber_collect_supported(device):
     return is_amber_collect_supported
 
 #**********************************************************
+#        Strip ANSI SGR color escape sequences (e.g. ESC[31m, ESC[0m) that
+#        mlxlink/mstlink emit, so saved/collected output stays plain text.
+def strip_ansi_colors(text):
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+#**********************************************************
 #        Helper for mstcommand_d_handler - handles commands with given number of runs
 def command_with_number_of_runs(number_of_runs, device, command, suffix, pcie_debug, pci_device=False):
     no_log_status_output("mkdir " + path + file_name + "/amber_info")
@@ -1684,6 +1701,11 @@ def command_with_number_of_runs(number_of_runs, device, command, suffix, pcie_de
         else:
             suffix_list.append(suffix)
         for suff in suffix_list:
+            # For the PCIe -c -e suffix, run -c -e per valid PCIe link
+            # (--depth/--pcie_index/--node) via --show_link instead of the plain -c -e run.
+            if "--port_type PCIE -c -e" in suff:
+                command_result += run_show_link(device)
+                continue
             command_result += "\n#" + str(i+1) + " " + command + " -d " + device + suff + "\n\n"
             mlxlink_command = "mlxlink -d " + device + suff
             mlx_st, command_result_device = get_status_output(command + " -d " + device + suff, "30")
@@ -1691,12 +1713,62 @@ def command_with_number_of_runs(number_of_runs, device, command, suffix, pcie_de
                 output = command + "_" + device + "_run_" + str(i + 1)
                 filtered_file_name = output.replace(":", "").replace(".", "")
                 save_mlxlink_output_to_file(filtered_file_name,command_result_device)
-            command_result_device = command_result_device.replace("[31m","").replace("[32m","").replace("[33m","").replace("[0m","")
+            command_result_device = strip_ansi_colors(command_result_device)
             if (mlx_st != 0):
                 command_result_device = "Errors detected while running: " + command + " -d " + device + suffix + '"\n' + command_result_device
                 command_result += command_result_device
                 break
             command_result += command_result_device
+    return command_result
+
+#**********************************************************
+#        show_link per-link handler (mlxlink / mstlink --show_link)
+def parse_valid_pcie_links(show_link_output):
+    # Parse the "Valid PCIe Links" table emitted by <tool> --port_type PCIE --show_link.
+    # Each data row looks like:
+    #   Link 1   : 0     ,0          ,0    ,0    ,0018:01:00.0 ,UP
+    # i.e. depth, pcie_index, node, port, bdf, link_status (comma separated).
+    links = []
+    for line in show_link_output.splitlines():
+        link_match = re.match(r"\s*Link\s+\d+\s*:\s*(.+)", line)
+        if not link_match:
+            continue
+        fields = [field.strip() for field in link_match.group(1).split(",")]
+        if len(fields) < 6:
+            continue
+        links.append({"depth": fields[0], "pcie_index": fields[1], "node": fields[2],
+                      "port": fields[3], "bdf": fields[4], "link_status": fields[5]})
+    return links
+
+def run_show_link(device):
+    # Enumerate the device's valid PCIe links via --show_link, then run
+    # "-c -e --depth <d> --pcie_index <pi> --node <n>" for every link.
+    # Binary follows MFT/MST availability: mlxlink when MFT is installed, else mstlink.
+    tool = "mlxlink" if is_MFT_installed else "mstlink"
+    command_result = ""
+    show_link_cmd = "%s -d %s --port_type PCIE --show_link" % (tool, device)
+    command_result += "\n# %s\n\n" % show_link_cmd
+    st, show_link_output = get_status_output(show_link_cmd, "30")
+    show_link_output = strip_ansi_colors(show_link_output)
+    command_result += show_link_output + "\n"
+    if st != 0:
+        command_result += "Errors detected while running: %s\n" % show_link_cmd
+        return command_result
+    links = parse_valid_pcie_links(show_link_output)
+    if not links:
+        command_result += "No valid PCIe links found for %s\n" % device
+        return command_result
+    for link in links:
+        suffix = " --port_type PCIE -c -e --depth %s --pcie_index %s --node %s" % (
+            link["depth"], link["pcie_index"], link["node"])
+        per_link_cmd = "%s -d %s%s" % (tool, device, suffix)
+        command_result += "\n# %s  (port %s, bdf %s, %s)\n\n" % (
+            per_link_cmd, link["port"], link["bdf"], link["link_status"])
+        link_st, per_link_output = get_status_output(per_link_cmd, "30")
+        per_link_output = strip_ansi_colors(per_link_output)
+        if link_st != 0:
+            per_link_output = "Errors detected while running: %s\n%s" % (per_link_cmd, per_link_output)
+        command_result += per_link_output + "\n"
     return command_result
 
 #**********************************************************
@@ -1750,7 +1822,7 @@ def mstcommand_d_handler(command,pcie_debug = False):
             continue
         device = pci_device["device"]
         if is_MFT_installed:
-            if device  not in mst_status_output:
+            if not _in_mst_status(device, mst_status_output):
                 continue
         elif is_MST_installed:
             if device in vf_pf_devices:
@@ -1798,6 +1870,11 @@ def _line_contains_card(line, card):
     short = _pci_bdf_short_form(card)
     return bool(short and short in line)
 
+def _in_mst_status(name, mst_status_output):
+    """Match a BDF / mst device without its trailing function: mst status may list a
+    card only once, but every PF (.0, .1, ...) still has to be collected."""
+    return name.rsplit(".", 1)[0] in mst_status_output
+
 def _get_fw_ctl_device(card, mft_installed):
     """First line in mst status -v / mstdevices_info -v that contains card and a /dev/fwctl path."""
     if not card:
@@ -1807,13 +1884,15 @@ def _get_fw_ctl_device(card, mft_installed):
     st, res = get_status_output(cmd)
     if st != 0:
         return None
-    for line in res.splitlines():
-        ls = line.strip()
-        if not _line_contains_card(ls, card):
-            continue
-        m = re.search(r"(/dev/fwctl/\S+)", ls)
-        if m:
-            return m.group(1).rstrip(".,;:")
+    # Exact match on all lines first; short BDF is a fallback (it can match another domain).
+    for matches in (lambda l: card in l, lambda l: _line_contains_card(l, card)):
+        for line in res.splitlines():
+            ls = line.strip()
+            if not matches(ls):
+                continue
+            m = re.search(r"(/dev/fwctl/\S+)", ls)
+            if m:
+                return m.group(1).rstrip(".,;:")
     return None
 
 def _handle_tools_cmd(command, card, timeout = '80'):
@@ -2113,7 +2192,7 @@ def generate_mst_config(device, mstregdump_out):
 
 def generate_card_logs(card, mstregdump_out, mst_status_output):
     if is_MFT_installed:
-        if card not in mst_status_output:
+        if not _in_mst_status(card, mst_status_output):
             return
     elif is_MST_installed:
         if card in vf_pf_devices:
@@ -2163,7 +2242,7 @@ def process_card_worker(args):
         # Remove first segment (before first colon) from device for comparison (e.g., '0000:c1:00.0' -> 'c1:00.0')
         device_parts = device.split(':', 1)
         device_for_check = device_parts[1] if len(device_parts) > 1 else device
-        if device_for_check not in mst_status_output:
+        if not _in_mst_status(device_for_check, mst_status_output):
             return local_output
     elif is_MST_installed:
         if device in vf_pf_devices:
@@ -2635,7 +2714,7 @@ def mlxreg_handler():
         if interfaces_flag:
             mst_devices = specific_mst_devices
         for device in mst_devices:
-            if device not in mst_status_output:
+            if not _in_mst_status(device, mst_status_output):
                 continue
             if not "cable" in device:
                 res +=  "mlxreg -d /dev/mst/" + device +" --reg_name ROCE_ACCL --get \n\n"
